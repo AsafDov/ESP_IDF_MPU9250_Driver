@@ -6,7 +6,6 @@
 #include "esp_log.h"
 #include "mpu9250_driver.h"
 #include "mpu9240_register_map.h"
-#include "kalman.h"
 
 #define TAG "MPU9250"
 #define I2C_MASTER_TIMEOUT_MS       1000
