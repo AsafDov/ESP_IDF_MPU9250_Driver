@@ -20,66 +20,12 @@
 #define SCL_PIN GPIO_NUM_22
 #define SDA_PIN GPIO_NUM_21
 
-// OLED CONFIG
-#define OLED_I2C_ADDRESS 0x3c
-#define OLED_SCREEN_WIDTH 128
-#define OLED_SCREEN_HEIGHT 64
-#define OLED_STATUS_BAR_HEIGHT 16
-#define OLED_CONTENT_HEIGHT (OLED_SCREEN_HEIGHT - OLED_STATUS_BAR_HEIGHT)
-#define OLED_REFRESH_RATE_MS 100
-
 // MPU9250 Config
 #define MPU9250_SENSOR_ADDR 0x68
 
 // Globals:
 
 // Functions
-// Random walk function task
-void random_walk(void* params){
-    oled_handle_t oled_handle = (oled_handle_t)params;
-    srand(time(NULL));
-    int x = rand() % 128;
-    int y = rand() % 48 + 16;
-    int dir = 0;
-    while (1) {
-        oled_square_filled(oled_handle, x, y, x + 1, y + 1);
-        vTaskDelay(oled_get_refresh_rate(oled_handle) / portTICK_PERIOD_MS);
-        dir = rand() % 4; // Random direction: 0=up, 1=down, 2=left, 3=right
-        switch (dir) {
-            case 0: // Up
-                y = ((y-16) - 1 + 48 ) % 48 + 16;
-                break;
-            case 1: // Down
-                y = ((y-16) + 1 ) % 48 + 16;
-                break;
-            case 2: // Left
-                x = (x - 1 + 128) % 128;
-                break;
-            case 3: // Right
-                x = (x + 1) % 128;
-                break;
-        }
-    }
-};
-
-oled_handle_t oled_install(i2c_master_bus_handle_t bus_handle){
-    static const char *TAG = "OLED";
-    /* Configure and Instantiate OLED device */
-    ESP_LOGI(TAG, "Configuring OLED");
-    oled_config_t oled_cfg = {
-        .device_address = OLED_I2C_ADDRESS,
-        .address_bit_length = I2C_ADDR_BIT_LEN_7,
-        .width = OLED_SCREEN_WIDTH,
-        .height = OLED_SCREEN_HEIGHT,
-        .refresh_rate_ms = OLED_REFRESH_RATE_MS,
-        .scl_speed_hz = SCL_SPEED_HZ,
-    };
-    ESP_LOGI(TAG, "Initializing OLED");
-    oled_handle_t oled_handle = oled_init(bus_handle, &oled_cfg);
-    ESP_LOGI(TAG, "OLED Initialized");
-
-    return oled_handle;
-};
 
 mpu9250_handle_t mpu9250_install(i2c_master_bus_handle_t bus_handle){
     static const char *TAG = "MPU 9250";
@@ -114,8 +60,6 @@ void app_main(void)
     i2c_master_bus_handle_t bus_handle;
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_mst_config, &bus_handle));
 
-    // oled_handle_t oled_handle = oled_install(bus_handle);
-
     mpu9250_handle_t mpu9250_handle = mpu9250_install(bus_handle);
     QueueHandle_t mpu9250_data_queue = mpu9250_get_data_queue(mpu9250_handle);
 
@@ -127,16 +71,15 @@ void app_main(void)
         *   - yaw: rotation around the Y-axis
         */
 
-        orientation_t orientation;
-        if (xQueueReceive(mpu9250_data_queue, &orientation, portMAX_DELAY) == pdTRUE) {
+        quaternion_t q;
+        if (xQueueReceive(mpu9250_data_queue, &q, portMAX_DELAY) == pdTRUE) {
             // Process the received orientation data
-            // ESP_LOGI("MPU DATA", "Pitch: %.2f, Roll: %.2f, Yaw: %.2f", orientation.pitch, orientation.roll, orientation.yaw);
+            float pitch, roll, yaw;
+            quaternion_to_euler(q, &pitch, &roll, &yaw);
+            ESP_LOGI("MPU DATA", "Pitch: %.0f, Roll: %.0f, Yaw: %.0f | Quaternion - w: %.2f, x: %.2f, y: %.2f, z: %.2f", pitch, roll, yaw, q.w, q.x, q.y, q.z);
+            // ESP_LOGI("MPU DATA", "Quaternion - w: %.2f, x: %.2f, y: %.2f, z: %.2f", q.w, q.x, q.y, q.z);
             vTaskDelay(pdMS_TO_TICKS(10)); // Might not need to wait cause queue task is waiting
         }
     }
-
-
-    /* Start random walk task example */
-    // xTaskCreatePinnedToCore(random_walk, "random_walk", 2048, oled_handle, 5, NULL, 1);
 
 }

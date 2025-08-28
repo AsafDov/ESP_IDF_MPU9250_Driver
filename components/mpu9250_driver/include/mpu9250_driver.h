@@ -20,12 +20,14 @@ typedef struct mpu_config{
 } mpu9250_config_t;
 
 typedef struct {
-    float pitch; // Rotation about Z-axis
-    float roll;  // Rotation about X-axis
-    float yaw;   // Rotation about Y-axis
-} orientation_t;
+    float w;
+    float x;
+    float y;
+    float z;
+} quaternion_t;
 
 mpu9250_handle_t mpu9250_init(i2c_master_bus_handle_t bus_handle, mpu9250_config_t* mpu9250_cfg);
 QueueHandle_t mpu9250_get_data_queue(mpu9250_handle_t mpu_handle);
 uint16_t mpu_get_raw_angle(mpu9250_handle_t mpu_handle);
 uint16_t mpu_get_filtered_angle(mpu9250_handle_t mpu_handle);
+void quaternion_to_euler(quaternion_t q, float* pitch, float* roll, float* yaw);

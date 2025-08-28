@@ -12,13 +12,12 @@
 #define I2C_MASTER_TIMEOUT_MS       1000
 
 typedef struct{
-    float pitch_from_accel;
-    float pitch_from_gyro;
-    float roll_from_accel;
-    float roll_from_gyro;
-    float yaw_from_mag;
-    float yaw_from_gyro;
-    uint64_t dt;
+    float ax, ay, az;
+    float gx, gy, gz;
+    float mx, my, mz;
+    float dt;
+    float gx_bias, gy_bias, gz_bias;
+    float mx_bias, my_bias, mz_bias;
 }angles_buf_t;
 
 struct mpu{
@@ -29,9 +28,9 @@ struct mpu{
     uint32_t scl_wait_us;                      /*!< Timeout value. (unit: us). Please note this value should not be so small that it can handle stretch/disturbance properly. If 0 is set, that means use the default reg value*/
     uint16_t accel_sensitivity;                 /*!< Accelerometer sensitivity setting. */
     angles_buf_t angles_buf;
-    KalmanFilter roll_filter;
-    KalmanFilter pitch_filter;
-    KalmanFilter yaw_filter;
+    quaternion_t q;
+    float integral_error[3]; // For mahony filter, might change to magewick
+    uint64_t last_update_time_us;
     struct {
         uint32_t disable_ack_check:      1;     /*!< Disable ACK check. If this is set false, that means ack check is enabled, the transaction will be stopped and API returns error when nack is detected. */
     } flags;      
@@ -41,25 +40,20 @@ struct mpu{
     
 };
 
-orientation_t process_fifo_data(mpu9250_handle_t handle, uint8_t *fifo_data){
+void process_fifo_data(mpu9250_handle_t handle, uint8_t *fifo_data){
     // TODO make sensitivity more generalized
     int sensitivity = MPU9250_ACCEL_SENSITIVITY_4G;
-    orientation_t orientation = {
-        .pitch = 0, 
-        .roll = 0,
-        .yaw = 0
-    };
 
     // Process the FIFO data to extract sensor readings
     // --- Process Accelerometer Data ---
-    int16_t accel_x = (int16_t)((fifo_data[0] << 8)  | fifo_data[1]);
-    int16_t accel_y = (int16_t)((fifo_data[2] << 8)  | fifo_data[3]);
-    int16_t accel_z = (int16_t)((fifo_data[4] << 8)  | fifo_data[5]);
+    int16_t accel_x_raw = (int16_t)((fifo_data[0] << 8)  | fifo_data[1]);
+    int16_t accel_y_raw = (int16_t)((fifo_data[2] << 8)  | fifo_data[3]);
+    int16_t accel_z_raw = (int16_t)((fifo_data[4] << 8)  | fifo_data[5]);
     
     // --- Process Gyroscope Data ---
-    int16_t gyro_x = (int16_t)((fifo_data[6] << 8)  | fifo_data[7]);
-    int16_t gyro_y = (int16_t)((fifo_data[8] << 8)  | fifo_data[9]);
-    int16_t gyro_z = (int16_t)((fifo_data[10] << 8) | fifo_data[11]);
+    int16_t gyro_x_raw = (int16_t)((fifo_data[6] << 8)  | fifo_data[7]);
+    int16_t gyro_y_raw = (int16_t)((fifo_data[8] << 8)  | fifo_data[9]);
+    int16_t gyro_z_raw = (int16_t)((fifo_data[10] << 8) | fifo_data[11]);
     
     // --- Process Magnetometer data 
     int16_t mag_x_raw = (int16_t)((fifo_data[13] << 8) | fifo_data[12]);
@@ -67,78 +61,135 @@ orientation_t process_fifo_data(mpu9250_handle_t handle, uint8_t *fifo_data){
     int16_t mag_z_raw = (int16_t)((fifo_data[17] << 8) | fifo_data[16]);
 
     int8_t mag_status = fifo_data[6];
-
-    float mag_x_uT = (float)mag_x_raw * 0.6; // Convert to microteslas
-    float mag_y_uT = (float)mag_y_raw * 0.6; // Convert to microteslas
-    float mag_z_uT = (float)mag_z_raw * 0.6; // Convert to microteslas
-
-    // Convert raw values to 'g's using floating point and the stored sensitivity
-    float accel_x_g = (float)accel_x / sensitivity;
-    float accel_y_g = (float)accel_y / sensitivity;
-    float accel_z_g = (float)accel_z / sensitivity;
     
-    float gyro_x_dps = gyro_x / MPU9250_GYRO_SENSITIVITY_500dps;
-    float gyro_y_dps = gyro_y / MPU9250_GYRO_SENSITIVITY_500dps;
-    float gyro_z_dps = gyro_z / MPU9250_GYRO_SENSITIVITY_500dps;
-
-    /* Orientation is defined as followed in my case:
-        *   - pitch: rotation around the Z-axis
-        *   - roll: rotation around the X-axis
-        *   - yaw: rotation around the Y-axis 
-        * 
-        * Gravity in my system is (0,-g,0) when breadboard is normally on table
-    */
-    // orientation.pitch = atan2f(accel_x_g, sqrtf(accel_y_g * accel_y_g + accel_z_g * accel_z_g)) * 180.0f / M_PI; // Around the Z axis
-    
-    /* Pitch from Accel*/
-    float pitch_rad = atan2f(-accel_x_g, -accel_y_g);
-    handle->angles_buf.pitch_from_accel = pitch_rad * 180.0f / M_PI; // Around the Z axis
-
-    /* Roll from Accel*/
-    float roll_rad = atan2f(-accel_z_g, -accel_y_g);
-    handle->angles_buf.roll_from_accel  = roll_rad * 180.0f / M_PI; // Around the X axis
+    /* Convert to physical dimentions */
+    handle->angles_buf.mx = (float)mag_y_raw * 0.6; // Convert to microteslas
+    handle->angles_buf.my = (float)mag_x_raw * 0.6; // Convert to microteslas
+    handle->angles_buf.mz = -(float)mag_z_raw * 0.6; // Convert to microteslas
 
     
-    /* Gyro integration */
+    handle->angles_buf.ax = (float)accel_x_raw / sensitivity; // (in g's)
+    handle->angles_buf.ay = (float)accel_y_raw / sensitivity; // (in g's)
+    handle->angles_buf.az = (float)accel_z_raw / sensitivity; // (in g's)
+
+    // ESP_LOGI(TAG, "Magnetometer - x: %.2f, y: %.2f, z: %.2f | x: %.2f, y: %.2f, z: %.2f", handle->angles_buf.mx, handle->angles_buf.my, handle->angles_buf.mz, handle->angles_buf.ax, handle->angles_buf.ay, handle->angles_buf.az);
+
+    handle->angles_buf.gx = (gyro_x_raw / MPU9250_GYRO_SENSITIVITY_500dps) * M_PI / 180.0f; // In degrees per second
+    handle->angles_buf.gy = (gyro_y_raw / MPU9250_GYRO_SENSITIVITY_500dps) * M_PI / 180.0f;
+    handle->angles_buf.gz = (gyro_z_raw / MPU9250_GYRO_SENSITIVITY_500dps) * M_PI / 180.0f;
+    
     uint64_t current_time_us = esp_timer_get_time();
-    // Calculate dt in seconds by finding the difference and converting from microseconds
-    float dt = (float)(current_time_us - handle->angles_buf.dt) / 1000000.0f;
-    // Update the last time for the next iteration
-    handle->angles_buf.dt = current_time_us;
-    
-    /* Apply Kalman Filter */
-    
-    kalman_predict(&handle->pitch_filter, gyro_z_dps, dt);
-    kalman_predict(&handle->roll_filter, gyro_x_dps, dt);
-    kalman_predict(&handle->yaw_filter, gyro_y_dps, dt);
-    
-    kalman_update(&handle->pitch_filter, handle->angles_buf.pitch_from_accel);
-    kalman_update(&handle->roll_filter, handle->angles_buf.roll_from_accel);
-    
-    /* Yaw From Magnetometer
-    * For the Yaw we need to first project the magnetometer data onto a hotizontal X Z plane 
-    */
-    float mag_comp_y = mag_y_uT * cos(handle->roll_filter.angle * M_PI / 180.0f) - mag_z_uT * sin(handle->roll_filter.angle * M_PI / 180.0f);
-    float mag_comp_z = mag_y_uT * sin(handle->roll_filter.angle * M_PI / 180.0f) * sin(handle->pitch_filter.angle * M_PI / 180.0f) + mag_x_uT * cos(handle->pitch_filter.angle * M_PI / 180.0f) + mag_z_uT * cos(handle->roll_filter.angle * M_PI / 180.0f) * sin(handle->pitch_filter.angle * M_PI / 180.0f);
-    handle->angles_buf.yaw_from_mag = atan2(mag_comp_z, mag_comp_y) * 180.0f / M_PI;
-    kalman_update(&handle->yaw_filter, handle->angles_buf.yaw_from_mag);
-
-    orientation.pitch = handle->pitch_filter.angle;
-    orientation.roll  = handle->roll_filter.angle;
-    orientation.yaw   = handle->yaw_filter.angle;
-
-    // ESP_LOGI("Orientation", "pitch from gyro: %.2f, roll from gyro: %.2f, yaw from gyro: %.2f", handle->angles_buf.pitch_from_gyro, handle->angles_buf.roll_from_gyro, handle->angles_buf.yaw_from_gyro);
-    // ESP_LOGI("RAW MPU DATA", "Accel: [%.2f, %.2f, %.2f], Gyro: [%.2f, %.2f, %.2f], Mag: [%.2f, %.2f, %.2f]", accel_x_g, accel_y_g, accel_z_g, gyro_x_dps, gyro_y_dps, gyro_z_dps, mag_x_uT, mag_y_uT, mag_z_uT);
-    ESP_LOGI("Orientation", "Pitch: %.1f, Roll: %.1f, Yaw: %.1f", orientation.pitch, orientation.roll, orientation.yaw);
-
-    return orientation;
+    handle->angles_buf.dt = (handle->last_update_time_us == 0) ? 0.01f : (float)(current_time_us - handle->last_update_time_us) / 1000000.0f;
+    handle->last_update_time_us = current_time_us;
 };
+
+void apply_mahony_filter(mpu9250_handle_t handle){
+    float q0 = handle->q.w, q1 = handle->q.x, q2 = handle->q.y, q3 = handle->q.z;
+    float ax = handle->angles_buf.ax, ay = handle->angles_buf.ay, az = handle->angles_buf.az;
+    float mx = handle->angles_buf.mx, my = handle->angles_buf.my, mz = handle->angles_buf.mz;
+    float gx = handle->angles_buf.gx, gy = handle->angles_buf.gy, gz = handle->angles_buf.gz;
+    float dt = handle->angles_buf.dt;
+    float norm;
+    float hx, hy, hz, bx, bz;
+    float vx, vy, vz, wx, wy, wz;
+    float ex, ey, ez;
+
+    // --- Tuning parameters for the Mahony filter ---
+    const float Kp = 60.0f; // Proportional gain
+    const float Ki = 1.00f; // Integral gain
+
+    // Normalize accelerometer measurement
+    norm = sqrtf(ax * ax + ay * ay + az * az);
+    if (norm > 0.0f) {
+        ax /= norm;
+        ay /= norm;
+        az /= norm;
+    }
+
+    // Normalize magnetometer measurement
+    norm = sqrtf(mx * mx + my * my + mz * mz);
+    if (norm > 0.0f) {
+        mx /= norm;
+        my /= norm;
+        mz /= norm;
+    }
+
+    // Reference direction of Earth's magnetic field
+    hx = 2.0f * (mx * (0.5f - q2 * q2 - q3 * q3) + my * (q1 * q2 - q0 * q3) + mz * (q1 * q3 + q0 * q2));
+    hy = 2.0f * (mx * (q1 * q2 + q0 * q3) + my * (0.5f - q1 * q1 - q3 * q3) + mz * (q2 * q3 - q0 * q1));
+    bx = sqrtf(hx * hx + hy * hy);
+    bz = 2.0f * (mx * (q1 * q3 - q0 * q2) + my * (q2 * q3 + q0 * q1) + mz * (0.5f - q1 * q1 - q2 * q2));
+
+    // Estimated direction of gravity and magnetic field
+    vx = 2.0f * (q1 * q3 - q0 * q2);
+    vy = 2.0f * (q0 * q1 + q2 * q3);
+    vz = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3;
+    wx = 2.0f * (bx * (0.5f - q2 * q2 - q3 * q3) + bz * (q1 * q3 - q0 * q2));
+    wy = 2.0f * (bx * (q1 * q2 - q0 * q3) + bz * (q0 * q1 + q2 * q3));
+    wz = 2.0f * (bx * (q0 * q2 + q1 * q3) + bz * (0.5f - q1 * q1 - q2 * q2));
+
+    // Error is cross product between estimated and measured direction
+    ex = (ay * vz - az * vy) + (my * wz - mz * wy);
+    ey = (az * vx - ax * vz) + (mz * wx - mx * wz);
+    ez = (ax * vy - ay * vx) + (mx * wy - my * wx);
+
+    // Integrate error terms
+    handle->integral_error[0] += ex * Ki * dt;
+    handle->integral_error[1] += ey * Ki * dt;
+    handle->integral_error[2] += ez * Ki * dt;
+    
+    // Apply feedback
+    gx += Kp * ex + handle->integral_error[0];
+    gy += Kp * ey + handle->integral_error[1];
+    gz += Kp * ez + handle->integral_error[2];
+
+    // Integrate rate of change of quaternion
+    q0 += (-q1 * gx - q2 * gy - q3 * gz) * 0.5f * dt;
+    q1 += (q0 * gx + q2 * gz - q3 * gy) * 0.5f * dt;
+    q2 += (q0 * gy - q1 * gz + q3 * gx) * 0.5f * dt;
+    q3 += (q0 * gz + q1 * gy - q2 * gx) * 0.5f * dt;
+
+    // Normalize quaternion and update handle
+    norm = sqrtf(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    handle->q.w = q0 / norm;
+    handle->q.x = q1 / norm;
+    handle->q.y = q2 / norm;
+    handle->q.z = q3 / norm;
+}
+void calibrate_sensors(mpu9250_handle_t handle){
+    ESP_LOGI(TAG, "Calibrating sensors...");
+    int fifo_size = 19; 
+    uint8_t fifo_data[fifo_size];
+    uint8_t write_buffer = MPU9250_FIFO_R_W_REG_ADDR;
+    int num_samples = 100;
+    int i=0;
+    while (i<num_samples) {
+        // Wait for the semaphore to be given
+        if (xSemaphoreTake(handle->data_semaphore, portMAX_DELAY) == pdTRUE) {
+            // Read the FIFO data
+            ESP_ERROR_CHECK(i2c_master_transmit_receive(handle->i2c_device_mpu9250_handle, &write_buffer, 1, fifo_data, fifo_size, -1));
+
+            // Process the FIFO data
+            process_fifo_data(handle, fifo_data);
+            handle->angles_buf.gx_bias += handle->angles_buf.gx;
+            handle->angles_buf.gy_bias += handle->angles_buf.gy;
+            handle->angles_buf.gz_bias += handle->angles_buf.gz;
+
+            i++;
+        }
+    }
+    handle->angles_buf.gx_bias /= num_samples;
+    handle->angles_buf.gy_bias /= num_samples;
+    handle->angles_buf.gz_bias /= num_samples;
+
+}
 void mpu9250_task(void* mpu9250_handle){
     mpu9250_handle_t handle = (mpu9250_handle_t)mpu9250_handle;
     int fifo_size = 19; 
     // Read the FIFO buffer NO INTERRUPT version
     uint8_t fifo_data[fifo_size];
     uint8_t write_buffer = MPU9250_FIFO_R_W_REG_ADDR;
+    calibrate_sensors(handle);
     while (1) {
         // Wait for the semaphore to be given
         if (xSemaphoreTake(handle->data_semaphore, portMAX_DELAY) == pdTRUE) {
@@ -146,10 +197,15 @@ void mpu9250_task(void* mpu9250_handle){
             ESP_ERROR_CHECK(i2c_master_transmit_receive(handle->i2c_device_mpu9250_handle, &write_buffer, 1, fifo_data, fifo_size, -1));
 
             // Process the FIFO data
-            orientation_t orientation = process_fifo_data(handle, fifo_data);
+            process_fifo_data(handle, fifo_data);
+            handle->angles_buf.gx -= handle->angles_buf.gx_bias;
+            handle->angles_buf.gy -= handle->angles_buf.gy_bias;
+            handle->angles_buf.gz -= handle->angles_buf.gz_bias;
+
+            apply_mahony_filter(handle);
 
             // Send to queue
-            xQueueSend(handle->data_queue, &orientation, 0);
+            xQueueSend(handle->data_queue, &handle->q, 0);
 
         }
     }
@@ -361,32 +417,6 @@ void send_configuration_commands(mpu9250_handle_t mpu_handle){
     write_buf[1] = 0x60; 
     mpu9250_send_command(mpu_handle, write_buf, sizeof(write_buf));
     
-    // /* Configure FIFO Enable Register for accelerometer*/
-    //! For the purpose of debugging, this to enables only accelerometer read
-    // ESP_LOGI(TAG, "Configuring FIFO Enable Register");
-    // // OLD VALUE: data = 0x78;
-    // data = 0x08; // FIX: Enable FIFO for Accelerometer ONLY. Disable Gyro.
-    // write_buf[0] = MPU9250_FIFO_EN_REG_ADDR;
-    // write_buf[1] = data;
-    // mpu9250_send_command(mpu_handle, write_buf, sizeof(write_buf));
-    
-    // /* Configure FIFO Enable Register for gyro */
-    // //! For the purpose of debugging, this to enables only gyro read
-    // ESP_LOGI(TAG, "Configuring FIFO Enable Register");
-    // // OLD VALUE: data = 0x78;
-    // data = 0x70; // FIX: Enable FIFO for Gyro ONLY. Disable Accelerometer.
-    // write_buf[0] = MPU9250_FIFO_EN_REG_ADDR;
-    // write_buf[1] = data;
-    // mpu9250_send_command(mpu_handle, write_buf, sizeof(write_buf));
-    
-    // //! ONLY MAGNETOMETER
-    // /* Configure FIFO Enable Register ONLY FOR MAGNETOMETER*/ 
-    // ESP_LOGI(TAG, "Configuring FIFO Enable Register");
-    // data = 0x01; // Enable FIFO for Magnetometer ONLY. Disable Gyro and Accelerometer.
-    // write_buf[0] = MPU9250_FIFO_EN_REG_ADDR;
-    // write_buf[1] = data;
-    // mpu9250_send_command(mpu_handle, write_buf, sizeof(write_buf));
-    
     /* Configure FIFO Enable Register for accelerometer and gyro and Magnetometer*/ 
     ESP_LOGI(TAG, "Configuring FIFO Enable Register");
     data = 0x79; // Enable FIFO for Gyro and Accelerometer. Disable slv, and temp output 0x79 to enable slave0 (Magnetometer) into FIFO
@@ -395,6 +425,31 @@ void send_configuration_commands(mpu9250_handle_t mpu_handle){
     mpu9250_send_command(mpu_handle, write_buf, sizeof(write_buf));
     
 }
+
+void quaternion_to_euler(quaternion_t q, float* pitch, float* roll, float* yaw) {
+    // roll (x-axis rotation)
+    float sinr_cosp = 2 * (q.w * q.x + q.y * q.z);
+    float cosr_cosp = 1 - 2 * (q.x * q.x + q.y * q.y);
+    *roll = atan2f(sinr_cosp, cosr_cosp);
+
+    // pitch (y-axis rotation)
+    float sinp = 2 * (q.w * q.y - q.z * q.x);
+    if (fabs(sinp) >= 1)
+        *pitch = copysignf(M_PI / 2, sinp); // use 90 degrees if out of range
+    else
+        *pitch = asinf(sinp);
+
+    // yaw (z-axis rotation)
+    float siny_cosp = 2 * (q.w * q.z + q.x * q.y);
+    float cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z);
+    *yaw = atan2f(siny_cosp, cosy_cosp);
+    
+    // Convert to degrees
+    *pitch *= 180.0f / M_PI;
+    *roll *= 180.0f / M_PI;
+    *yaw *= 180.0f / M_PI;
+}
+
 mpu9250_handle_t mpu9250_init(i2c_master_bus_handle_t bus_handle, mpu9250_config_t* mpu9250_cfg){
     // Allocate memory for the main driver structure
     mpu9250_handle_t handle = (mpu9250_handle_t)malloc(sizeof(struct mpu));
@@ -408,9 +463,6 @@ mpu9250_handle_t mpu9250_init(i2c_master_bus_handle_t bus_handle, mpu9250_config
     handle->dev_addr_length = mpu9250_cfg->dev_addr_length;
     handle->scl_speed_hz = mpu9250_cfg->scl_speed_hz;
     handle->scl_wait_us = mpu9250_cfg->scl_wait_us;
-    handle->angles_buf.pitch_from_gyro = 0.0f;
-    handle->angles_buf.roll_from_gyro = 0.0f;
-    handle->angles_buf.yaw_from_mag = 0.0f;
     handle->angles_buf.dt = esp_timer_get_time();
 
     // Configure the I2C device settings
@@ -424,13 +476,24 @@ mpu9250_handle_t mpu9250_init(i2c_master_bus_handle_t bus_handle, mpu9250_config
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &i2c_device_mpu9250_cfg, &handle->i2c_device_mpu9250_handle));
     ESP_LOGI(TAG, "MPU9250 device added to I2C bus");
     
-    // Initialize Kalman filters
-    kalman_init(&handle->pitch_filter);
-    kalman_init(&handle->roll_filter);
-    kalman_init(&handle->yaw_filter);
+    // Initialize the orientation quaternion to identity
+    handle->q.w = 1.0f;
+    handle->q.x = 0.0f;
+    handle->q.y = 0.0f;
+    handle->q.z = 0.0f;
+    
+    // Initialize integral error for the fusion algorithm
+    handle->integral_error[0] = 0.0f;
+    handle->integral_error[1] = 0.0f;
+    handle->integral_error[2] = 0.0f;
+    handle->angles_buf.gx_bias = 0.0f;
+    handle->angles_buf.gy_bias = 0.0f;
+    handle->angles_buf.gz_bias = 0.0f;
+
+    handle->last_update_time_us = 0;
 
     // initialize data queue
-    handle->data_queue = xQueueCreate(10, sizeof(uint8_t[3])); // Pitch, Roll, Yaw
+    handle->data_queue = xQueueCreate(10, sizeof(quaternion_t)); 
     handle->data_semaphore = xSemaphoreCreateBinary();
     
     // Configure the MPU9250
