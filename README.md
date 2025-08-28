@@ -1,35 +1,78 @@
-# ESP-IDF SSD1306 OLED Driver
+# ESP-IDF MPU9250 Driver
 
-## 📖 About
+[](https://opensource.org/licenses/MIT)
+[](https://github.com/espressif/esp-idf)
+[](https://github.com/AsafDov/ESP_IDF_MPU9250_Driver)
 
-This project is a lightweight, I2C-based driver for SSD1306 OLED displays, specifically designed for the Espressif IoT Development Framework (ESP-IDF). The goal is to provide a straightforward and efficient way to interface with these popular displays in your ESP32 projects.
+A robust, thread-safe MPU9250 9-DOF sensor driver for the Espressif IoT Development Framework (ESP-IDF). This driver is designed from the ground up to leverage the power of FreeRTOS, ensuring non-blocking, efficient, and reliable sensor data acquisition.
 
-Currently, the driver is in the early stages of development. The foundational functionalities, such as initialization, configuration, and basic drawing operations, are implemented. The included `main.c` provides a simple random walk example to demonstrate the driver's current capabilities.
+It utilizes the MPU9250's internal FIFO buffer to capture high-frequency sensor data (accelerometer, gyroscope, and magnetometer) and processes it through a Kalman filter to provide a stable orientation output in Euler angles (pitch, roll, and yaw).
 
 -----
 
 ## ✨ Features
 
-  * **I2C Communication:** Utilizes the ESP-IDF's I2C master driver for communication with the OLED display.
-  * **Display Initialization:** A comprehensive initialization sequence to configure the SSD1306 controller for standard 128x64 displays.
-  * **Local Framebuffer:** Implements a local framebuffer for efficient and flicker-free rendering.
-  * **Basic Drawing Primitives:** Includes a function to draw filled rectangles (`oled_square_filled`), which can be used for drawing individual pixels or lines.
-  * **Bitmap Support:** A function to display monochrome bitmaps is in development.
+  * **ESP-IDF v5.x Compatible:** Built using the latest I2C master driver APIs.
+  * **9-DOF Sensor Fusion:** Reads accelerometer, gyroscope, and the onboard AK8963 magnetometer.
+  * **FreeRTOS-Based:** Operates on dedicated FreeRTOS tasks, making your main application logic cleaner and non-blocking.
+  * **Thread-Safe:** Uses a FreeRTOS queue to safely pass processed orientation data to any consumer task.
+  * **FIFO Buffer Integration:** Efficiently reads sensor data in batches using the MPU9250's hardware FIFO, reducing I2C bus traffic.
+  * **Kalman Filter:** Implements a Kalman filter to fuse sensor data, minimizing noise and drift to produce a stable orientation.
+  * **Easy to Integrate:** A simple `_install` function and a clear data-retrieval API.
 
 -----
 
-## 🛠️ Hardware Requirements
+## 🏗️ Architecture
 
-  * An ESP32 development board
-  * An SSD1306-based OLED display (128x64 resolution)
-  * Jumper wires for connecting the display to the ESP32
+This driver's core strength lies in its multi-task architecture, which ensures high performance and thread safety.
 
-### Pin Configuration
+1.  **Polling Task (`check_buffer_task`):** A lightweight, high-priority task that continuously polls the MPU9250's FIFO count register. When a sufficient number of data frames are available, it gives a semaphore to signal the processing task.
+2.  **Processing Task (`mpu9250_task`):** This task remains blocked, consuming no CPU time, until it receives the semaphore. Once signaled, it performs a single I2C burst-read to retrieve the entire FIFO buffer, processes the raw data, applies the Kalman filter, and sends the final `orientation_t` data to a public queue.
+3.  **Application Task (`app_main` or other):** Your main application logic can receive the processed orientation data from the queue whenever it's needed, without ever directly interacting with the I2C bus or sensor hardware.
 
-The driver is configured to use the following default pins, which can be easily changed in `main.c`:
+This decoupled design, using a semaphore for synchronization and a queue for data transfer, makes the driver highly efficient and easy to integrate into complex applications.
 
-  * **SCL:** GPIO 22
-  * **SDA:** GPIO 21
+```
++--------------------------+
+|   check_buffer_task      |----(Polls FIFO Count)----> [MPU9250]
+| (High Priority, 10ms)    |
++--------------------------+
+            |
+            | xSemaphoreGive()
+            V
++--------------------------+
+|   mpu9250_task           |<---(Reads FIFO Buffer)--- [MPU9250]
+| (Waits on Semaphore)     |
+| - Processes Raw Data     |
+| - Applies Kalman Filter  |
++--------------------------+
+            |
+            | xQueueSend()
+            V
++--------------------------+
+|      Data Queue          |
+|  (orientation_t)         |
++--------------------------+
+            |
+            | xQueueReceive()
+            V
++--------------------------+
+|   Your Application Task  |
+| (e.g., app_main)         |
++--------------------------+
+```
+
+-----
+
+## 💡 Sensor Fusion: Kalman Filter
+
+To provide a stable orientation, this driver fuses data from all three sensors.
+
+  * **Accelerometer:** Provides a reliable sense of gravity (pitch and roll) over the long term but is susceptible to noise from linear acceleration (movement).
+  * **Gyroscope:** Provides excellent short-term information about the rate of rotation but suffers from drift over time.
+  * **Magnetometer:** Provides a heading reference (yaw) relative to the Earth's magnetic field, but can be disturbed by local magnetic interference.
+
+The driver uses a **Kalman filter** for each axis (pitch, roll, yaw) to optimally combine these sources. The gyroscope data is used to predict the new orientation, and the accelerometer/magnetometer data is used to correct for any accumulated drift. The result is a smooth and responsive orientation output that is more accurate than any single sensor could provide.
 
 -----
 
@@ -37,103 +80,110 @@ The driver is configured to use the following default pins, which can be easily 
 
 ### Prerequisites
 
-  * ESP-IDF v5.5 or later installed and configured.
-  * A working toolchain for building and flashing ESP32 projects.
+  * ESP-IDF v5.0 or later.
+  * An ESP32/S3/C3 series development board.
+  * An MPU9250 sensor module connected via I2C.
 
-### Configuration
+### 1\. Installation
 
-1.  **Clone the Repository:**
-    ```bash
-    git clone https://github.com/AsafDov/ESP_IDF_SSD1306_OLED_Driver/
-    ```
-2.  **Navigate to the Project Directory:**
-    ```bash
-    cd ESP_IDF_SSD1306_OLED_Driver
-    ```
-3.  **Configure the Project:**
-    Open `main.c` and adjust the I2C pins and OLED configuration macros as needed for your hardware setup.
-    ```c
-    #define SCL_PIN GPIO_NUM_22
-    #define SDA_PIN GPIO_NUM_21
+Clone this repository into the `components` directory of your ESP-IDF project:
 
-    #define OLED_I2C_ADDRESS 0x3c
-    #define OLED_SCREEN_WIDTH 128
-    #define OLED_SCREEN_HEIGHT 64
-    ```
-4.  **Build and Flash:**
-    ```bash
-    idf.py build
-    idf.py -p (YOUR_PORT) flash
-    ```
-5.  **Monitor the Output:**
-    ```bash
-    idf.py -p (YOUR_PORT) monitor
-    ```
+```bash
+cd your_project_directory/components
+git clone https://github.com/AsafDov/ESP_IDF_MPU9250_Driver.git
+```
 
-### Basic Usage Example
-![ezgif com-optimize (1)](https://github.com/user-attachments/assets/4bd85a07-feb8-43f4-b65d-c78f8a4fa3af)
+### 2\. Configuration & Initialization
 
-Here's a simplified example of how to use the driver:
+In your `app_main.c`, configure and initialize the I2C master bus, then install the MPU9250 driver.
 
 ```c
-#include "oled_driver.h"
+#include "driver/i2c_master.h"
+#include "mpu9250_driver.h"
 
-void app_main(void) {
-    // 1. Initialize the I2C master bus
-    i2c_master_bus_handle_t bus_handle;
-    // ... (I2C initialization code) ...
+// I2C Configuration
+#define SCL_SPEED_HZ 100000
+#define SCL_PIN      GPIO_NUM_22 // Change to your SCL pin
+#define SDA_PIN      GPIO_NUM_21 // Change to your SDA pin
+#define I2C_PORT     0
 
-    // 2. Configure the OLED display
-    oled_config_t oled_cfg = {
-        .device_address = OLED_I2C_ADDRESS,
-        .width = OLED_SCREEN_WIDTH,
-        .height = OLED_SCREEN_HEIGHT,
-        // ... (other configuration) ...
+// MPU9250 Configuration
+#define MPU9250_SENSOR_ADDR 0x68
+
+void app_main(void)
+{
+    // 1. Initialize I2C Master Bus
+    i2c_master_bus_config_t i2c_mst_config = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = I2C_PORT,
+        .scl_io_num = SCL_PIN,
+        .sda_io_num = SDA_PIN,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
+    i2c_master_bus_handle_t bus_handle;
+    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_mst_config, &bus_handle));
 
-    // 3. Initialize the OLED driver
-    oled_handle_t oled_handle = oled_init(&bus_handle, &oled_cfg);
+    // 2. Install the MPU9250 Driver
+    mpu9250_config_t mpu9250_cfg = {
+        .device_address = MPU9250_SENSOR_ADDR,
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .scl_speed_hz = SCL_SPEED_HZ,
+    };
+    mpu9250_handle_t mpu9250_handle = mpu9250_init(bus_handle, &mpu9250_cfg);
 
-    // 4. Draw to the framebuffer
-    oled_square_filled(oled_handle, 10, 10, 20, 20);
-
-    // 5. The oled_update_frame_buffer() is called within oled_square_filled()
-    //    to push the changes to the display.
+    // ... rest of your application
 }
+```
+
+### 3\. Reading Orientation Data
+
+Once initialized, the driver runs in the background. To get the latest orientation data, simply retrieve the driver's data queue handle and read from it in your application's main loop.
+
+```c
+#include "mpu9250_driver.h" // Also include headers from above
+
+void app_main(void)
+{
+    // ... I2C and MPU9250 initialization from step 2 ...
+
+    // 3. Get the handle to the data queue
+    QueueHandle_t mpu9250_data_queue = mpu9250_get_data_queue(mpu9250_handle);
+
+    // 4. Create a loop to receive and process data
+    while(1) {
+        orientation_t orientation;
+
+        // Wait indefinitely for new data to arrive in the queue
+        if (xQueueReceive(mpu9250_data_queue, &orientation, portMAX_DELAY) == pdTRUE) {
+            // New data received!
+            ESP_LOGI("MPU_DATA", "Pitch: %.2f, Roll: %.2f, Yaw: %.2f",
+                     orientation.pitch, orientation.roll, orientation.yaw);
+        }
+    }
+}
+
 ```
 
 -----
 
-## 📋 Driver API
+## 🔧 Status & Roadmap
 
-The public functions for interacting with the OLED driver are defined in `oled_driver.h`.
+This driver is currently **in active development**. The core functionality is operational, but there is more to come.
 
-| Function                       | Description                                                                                                                              |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `oled_init()`                  | Initializes the OLED driver and the display hardware.                                                                                    |
-| `oled_flush_gddram()`          | Clears the entire display by writing zeros to the GDDRAM.                                                                                |
-| `oled_print_bitmap()`          | (Under Development) Renders a monochrome bitmap on the screen.                                                                           |
-| `oled_square_filled()`         | Draws a filled rectangle on the display. Can be used to set individual pixels by providing the same start and end coordinates.             |
-| `oled_get_refresh_rate()`      | Returns the configured refresh rate of the display.                                                                                      |
-| `oled_update_frame_buffer()`   | Pushes the contents of the local framebuffer to the OLED display, making any changes visible.                                             |
-
------
-
-## 🚧 Development Status & Future Plans
-
-This driver is currently a **work in progress**. While the core functionality is in place, there is still much to be done.
-
-### Roadmap
-
-  * [ ] **Drawing Primitives:** Implement more advanced drawing functions for lines, circles, and text.
-  * [ ] **Status Bar Icons:** Implement editing of status bar with icon support
-  * [ ] **Text Library:** Implement a text rendering library
-  * [ ] **Font Support:** Add a font library for easy text rendering.
-  * [ ] **Optimization:** Refine the I2C communication and framebuffer handling for better performance.
-  * [ ] **Documentation:** Improve the in-code documentation and provide more detailed examples.
+  * [x] Basic I2C communication and device initialization.
+  * [x] Reading Accelerometer, Gyroscope, and Magnetometer.
+  * [x] FIFO-based data acquisition.
+  * [x] FreeRTOS multi-task architecture.
+  * [x] Kalman filter for sensor fusion.
+  * [ ] **TODO:** Implement runtime configuration for sensitivity (g-range, dps-range).
+  * [ ] **TODO:** Add comprehensive sensor calibration routines (gyro bias, accel bias, magnetometer hard/soft iron).
+  * [ ] **TODO:** Implement an alternative sensor fusion algorithm (e.g., Madgwick or Mahony) using quaternions.
+  * [ ] **TODO:** Add support for interrupt-driven FIFO reading.
+  * [ ] **TODO:** Add power management features.
 
 -----
 
 ## 🤝 Contributing
 
-Contributions, issues, and feature requests are welcome\! Feel free to check the [issues page](https://www.google.com/search?q=https://github.com/your-username/your-repository/issues).
+Contributions, issues, and feature requests are welcome\! Feel free to check the [issues page](https://www.google.com/search?q=https://github.com/AsafDov/ESP_IDF_MPU9250_Driver/issues).
