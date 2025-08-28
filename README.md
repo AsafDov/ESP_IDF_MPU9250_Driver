@@ -6,7 +6,7 @@
 
 A robust, thread-safe MPU9250 9-DOF sensor driver for the Espressif IoT Development Framework (ESP-IDF). This driver is designed from the ground up to leverage the power of FreeRTOS, ensuring non-blocking, efficient, and reliable sensor data acquisition.
 
-It utilizes the MPU9250's internal FIFO buffer to capture high-frequency sensor data (accelerometer, gyroscope, and magnetometer) and processes it through a Kalman filter to provide a stable orientation output in Euler angles (pitch, roll, and yaw).
+It utilizes the MPU9250's internal FIFO buffer to capture high-frequency sensor data (accelerometer, gyroscope, and magnetometer) and processes it through a **Mahony filter** to provide a stable orientation output as **quaternions**, which avoids gimbal lock and can be easily converted to Euler angles (pitch, roll, and yaw).
 
 -----
 
@@ -17,8 +17,9 @@ It utilizes the MPU9250's internal FIFO buffer to capture high-frequency sensor 
   * **FreeRTOS-Based:** Operates on dedicated FreeRTOS tasks, making your main application logic cleaner and non-blocking.
   * **Thread-Safe:** Uses a FreeRTOS queue to safely pass processed orientation data to any consumer task.
   * **FIFO Buffer Integration:** Efficiently reads sensor data in batches using the MPU9250's hardware FIFO, reducing I2C bus traffic.
-  * **Kalman Filter:** Implements a Kalman filter to fuse sensor data, minimizing noise and drift to produce a stable orientation.
-  * **Easy to Integrate:** A simple `_install` function and a clear data-retrieval API.
+  * **Mahony Filter:** Implements a Mahony filter to fuse sensor data, minimizing noise and drift to produce a stable orientation.
+  * **Quaternion Output:** Provides orientation data as quaternions to prevent gimbal lock, with a helper function to convert to Euler angles.
+  * **Easy to Integrate:** A simple `_init` function and a clear data-retrieval API.
 
 -----
 
@@ -27,7 +28,7 @@ It utilizes the MPU9250's internal FIFO buffer to capture high-frequency sensor 
 This driver's core strength lies in its multi-task architecture, which ensures high performance and thread safety.
 
 1.  **Polling Task (`check_buffer_task`):** A lightweight, high-priority task that continuously polls the MPU9250's FIFO count register. When a sufficient number of data frames are available, it gives a semaphore to signal the processing task.
-2.  **Processing Task (`mpu9250_task`):** This task remains blocked, consuming no CPU time, until it receives the semaphore. Once signaled, it performs a single I2C burst-read to retrieve the entire FIFO buffer, processes the raw data, applies the Kalman filter, and sends the final `orientation_t` data to a public queue.
+2.  **Processing Task (`mpu9250_task`):** This task remains blocked, consuming no CPU time, until it receives the semaphore. Once signaled, it performs a single I2C burst-read to retrieve the entire FIFO buffer, processes the raw data, applies the Mahony filter, and sends the final `quaternion_t` data to a public queue.
 3.  **Application Task (`app_main` or other):** Your main application logic can receive the processed orientation data from the queue whenever it's needed, without ever directly interacting with the I2C bus or sensor hardware.
 
 This decoupled design, using a semaphore for synchronization and a queue for data transfer, makes the driver highly efficient and easy to integrate into complex applications.
@@ -44,14 +45,14 @@ This decoupled design, using a semaphore for synchronization and a queue for dat
 |   mpu9250_task           |<---(Reads FIFO Buffer)--- [MPU9250]
 | (Waits on Semaphore)     |
 | - Processes Raw Data     |
-| - Applies Kalman Filter  |
+| - Applies Mahony Filter  |
 +--------------------------+
             |
             | xQueueSend()
             V
 +--------------------------+
 |      Data Queue          |
-|  (orientation_t)         |
+|  (quaternion_t)          |
 +--------------------------+
             |
             | xQueueReceive()
@@ -64,7 +65,7 @@ This decoupled design, using a semaphore for synchronization and a queue for dat
 
 -----
 
-## 💡 Sensor Fusion: Kalman Filter
+## 💡 Sensor Fusion: Mahony Filter & Quaternions
 
 To provide a stable orientation, this driver fuses data from all three sensors.
 
@@ -72,7 +73,9 @@ To provide a stable orientation, this driver fuses data from all three sensors.
   * **Gyroscope:** Provides excellent short-term information about the rate of rotation but suffers from drift over time.
   * **Magnetometer:** Provides a heading reference (yaw) relative to the Earth's magnetic field, but can be disturbed by local magnetic interference.
 
-The driver uses a **Kalman filter** for each axis (pitch, roll, yaw) to optimally combine these sources. The gyroscope data is used to predict the new orientation, and the accelerometer/magnetometer data is used to correct for any accumulated drift. The result is a smooth and responsive orientation output that is more accurate than any single sensor could provide.
+The driver uses a **Mahony filter** to optimally combine these sources. This filter is a lightweight and computationally efficient algorithm that uses a proportional and integral feedback loop to correct the gyroscope's drift based on the direction of gravity from the accelerometer and the magnetic heading from the magnetometer.
+
+The orientation is calculated and maintained as a **quaternion**. A quaternion is a four-dimensional mathematical representation of orientation that avoids the "gimbal lock" problem inherent in Euler angles, providing a more robust and reliable solution for tracking orientation in 3D space. A helper function is provided to convert the quaternion to Euler angles for display or simpler applications.
 
 -----
 
@@ -100,6 +103,7 @@ In your `app_main.c`, configure and initialize the I2C master bus, then install 
 ```c
 #include "driver/i2c_master.h"
 #include "mpu9250_driver.h"
+#include "esp_log.h"
 
 // I2C Configuration
 #define SCL_SPEED_HZ 100000
@@ -138,7 +142,7 @@ void app_main(void)
 
 ### 3\. Reading Orientation Data
 
-Once initialized, the driver runs in the background. To get the latest orientation data, simply retrieve the driver's data queue handle and read from it in your application's main loop.
+Once initialized, the driver runs in the background. To get the latest orientation data, retrieve the driver's data queue handle, read the quaternion, and use the provided helper function to convert it to Euler angles.
 
 ```c
 #include "mpu9250_driver.h" // Also include headers from above
@@ -152,17 +156,18 @@ void app_main(void)
 
     // 4. Create a loop to receive and process data
     while(1) {
-        orientation_t orientation;
+        quaternion_t orientation_q;
 
-        // Wait indefinitely for new data to arrive in the queue
-        if (xQueueReceive(mpu9250_data_queue, &orientation, portMAX_DELAY) == pdTRUE) {
+        // Wait indefinitely for a new quaternion to arrive in the queue
+        if (xQueueReceive(mpu9250_data_queue, &orientation_q, portMAX_DELAY) == pdTRUE) {
             // New data received!
-            ESP_LOGI("MPU_DATA", "Pitch: %.2f, Roll: %.2f, Yaw: %.2f",
-                     orientation.pitch, orientation.roll, orientation.yaw);
+            float pitch, roll, yaw;
+            quaternion_to_euler(orientation_q, &pitch, &roll, &yaw);
+            
+            ESP_LOGI("MPU_DATA", "Pitch: %.2f, Roll: %.2f, Yaw: %.2f", pitch, roll, yaw);
         }
     }
 }
-
 ```
 
 -----
@@ -175,10 +180,10 @@ This driver is currently **in active development**. The core functionality is op
   * [x] Reading Accelerometer, Gyroscope, and Magnetometer.
   * [x] FIFO-based data acquisition.
   * [x] FreeRTOS multi-task architecture.
-  * [x] Kalman filter for sensor fusion.
+  * [x] Mahony filter for sensor fusion using quaternions.
   * [ ] **TODO:** Implement runtime configuration for sensitivity (g-range, dps-range).
-  * [ ] **TODO:** Add comprehensive sensor calibration routines (gyro bias, accel bias, magnetometer hard/soft iron).
-  * [ ] **TODO:** Implement an alternative sensor fusion algorithm (e.g., Madgwick or Mahony) using quaternions.
+  * [ ] **TODO:** Add comprehensive sensor calibration routines (accel bias, magnetometer hard/soft iron).
+  * [ ] **TODO:** Implement an alternative sensor fusion algorithm (e.g., Madgwick).
   * [ ] **TODO:** Add support for interrupt-driven FIFO reading.
   * [ ] **TODO:** Add power management features.
 
